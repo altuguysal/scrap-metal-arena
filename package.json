@@ -1,0 +1,15 @@
+{
+  "name": "scrap-metal-arena-server",
+  "version": "0.1.0",
+  "description": "Multiplayer signaling + state-relay server for Scrap Metal Arena",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
