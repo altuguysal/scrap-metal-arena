@@ -8,23 +8,23 @@
 //  Then in the game's Settings, set the Server URL to ws://localhost:8080
 //  (or wherever you deploy this — Render / Fly / Railway / your VPS).
 // ----------------------------------------------------------------------
-
+ 
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
-
+ 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const wss = new WebSocket.Server({ port: PORT });
-
+ 
 console.log(`[arena] WebSocket server listening on :${PORT}`);
-
+ 
 // --- Registry ---
 // Map<playerID, { ws, name, partyID, lastSeen, state }>
 const players = new Map();
 // Map<partyID, { hostID, members: Set<playerID>, started: boolean, startedAt }>
 const parties = new Map();
 let nextPartyID = 1;
-
+ 
 // --- Global leaderboard ---
 // Map<playerID, { name, wins, score, kills, updatedAt }>
 // Persisted to disk every 60s. Survives reboots.
@@ -52,7 +52,7 @@ loadLeaderboard();
 setInterval(saveLeaderboard, 60_000);
 process.on('SIGTERM', saveLeaderboard);
 process.on('SIGINT', () => { saveLeaderboard(); process.exit(0); });
-
+ 
 function getTopLeaderboard(limit = 50) {
   const arr = [];
   for (const [id, v] of leaderboard) {
@@ -68,15 +68,15 @@ function getTopLeaderboard(limit = 50) {
   arr.sort((a, b) => (b.wins - a.wins) || (b.score - a.score) || (b.kills - a.kills));
   return arr.slice(0, limit);
 }
-
+ 
 function makePartyID() { return 'p' + (nextPartyID++); }
-
+ 
 function send(ws, type, payload = {}) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try { ws.send(JSON.stringify({ type, ...payload })); }
   catch (e) { /* ignore broken pipes */ }
 }
-
+ 
 function broadcastToParty(partyID, type, payload, exceptID) {
   const party = parties.get(partyID);
   if (!party) return;
@@ -86,7 +86,7 @@ function broadcastToParty(partyID, type, payload, exceptID) {
     if (p) send(p.ws, type, payload);
   }
 }
-
+ 
 function getPartyView(partyID) {
   const party = parties.get(partyID);
   if (!party) return null;
@@ -100,7 +100,7 @@ function getPartyView(partyID) {
     }),
   };
 }
-
+ 
 function leaveParty(playerID) {
   const player = players.get(playerID);
   if (!player || !player.partyID) return;
@@ -121,16 +121,16 @@ function leaveParty(playerID) {
     broadcastToParty(partyID, 'partyUpdate', { party: getPartyView(partyID) });
   }
 }
-
+ 
 wss.on('connection', (ws) => {
   let myID = null;
-
+ 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
-
+ 
     switch (msg.type) {
-
+ 
       // -------- Register / login --------
       case 'register': {
         const id = String(msg.playerID || '').trim();
@@ -151,7 +151,7 @@ wss.on('connection', (ws) => {
         send(ws, 'registered', { playerID: id, name });
         return;
       }
-
+ 
       // -------- Search by ID --------
       case 'searchPlayer': {
         const id = String(msg.playerID || '').trim();
@@ -171,7 +171,7 @@ wss.on('connection', (ws) => {
         }
         return;
       }
-
+ 
       // -------- Send invite --------
       case 'invite': {
         if (!myID) return;
@@ -210,7 +210,7 @@ wss.on('connection', (ws) => {
         send(ws, 'inviteSent', { toID: targetID });
         return;
       }
-
+ 
       // -------- Accept invite --------
       case 'acceptInvite': {
         if (!myID) return;
@@ -226,7 +226,7 @@ wss.on('connection', (ws) => {
         broadcastToParty(partyID, 'partyUpdate', { party: getPartyView(partyID) });
         return;
       }
-
+ 
       // -------- Decline invite --------
       case 'declineInvite': {
         const fromID = String(msg.fromID || '');
@@ -234,7 +234,7 @@ wss.on('connection', (ws) => {
         if (from) send(from.ws, 'inviteDeclined', { byID: myID });
         return;
       }
-
+ 
       // -------- Leave party --------
       case 'leaveParty': {
         if (!myID) return;
@@ -242,7 +242,7 @@ wss.on('connection', (ws) => {
         send(ws, 'partyLeft', {});
         return;
       }
-
+ 
       // -------- Start match (host only) --------
       case 'startMatch': {
         if (!myID) return;
@@ -262,7 +262,7 @@ wss.on('connection', (ws) => {
         });
         return;
       }
-
+ 
       // -------- End match (host only, or auto when only 1 alive) --------
       case 'endMatch': {
         if (!myID) return;
@@ -274,7 +274,7 @@ wss.on('connection', (ws) => {
         broadcastToParty(me.partyID, 'matchEnd', { winnerID: msg.winnerID || null });
         return;
       }
-
+ 
       // -------- Real-time state relay --------
       case 'state': {
         if (!myID) return;
@@ -288,7 +288,7 @@ wss.on('connection', (ws) => {
         broadcastToParty(me.partyID, 'peerState', { fromID: myID, state: msg.state }, myID);
         return;
       }
-
+ 
       // -------- Damage event (client-authoritative) --------
       case 'hit': {
         if (!myID) return;
@@ -304,7 +304,7 @@ wss.on('connection', (ws) => {
         });
         return;
       }
-
+ 
       // -------- Player died (client says so) --------
       case 'died': {
         if (!myID) return;
@@ -313,13 +313,13 @@ wss.on('connection', (ws) => {
         broadcastToParty(me.partyID, 'peerDied', { fromID: myID, killerID: msg.killerID || null });
         return;
       }
-
+ 
       // -------- Heartbeat --------
       case 'ping': {
         send(ws, 'pong', { t: msg.t });
         return;
       }
-
+ 
       // -------- Submit a leaderboard score --------
       // Expects { wins, score, kills, name }. Stores the highest values seen
       // for this player so a single bad match can't tank their rank.
@@ -340,7 +340,7 @@ wss.on('connection', (ws) => {
         send(ws, 'scoreSubmitted', { ok: true });
         return;
       }
-
+ 
       // -------- Fetch the top of the leaderboard --------
       case 'getLeaderboard': {
         const limit = Math.max(1, Math.min(200, Number(msg.limit) || 50));
@@ -364,19 +364,19 @@ wss.on('connection', (ws) => {
       }
     }
   });
-
+ 
   ws.on('close', () => {
     if (myID) {
       leaveParty(myID);
       players.delete(myID);
     }
   });
-
+ 
   ws.on('error', (err) => {
     console.warn('[arena] socket error:', err.message);
   });
 });
-
+ 
 // --- Cleanup loop: drop stale players (no heartbeat for 60s) ---
 setInterval(() => {
   const now = Date.now();
@@ -387,3 +387,4 @@ setInterval(() => {
     }
   }
 }, 30000);
+ 
