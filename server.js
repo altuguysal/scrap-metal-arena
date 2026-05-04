@@ -10,6 +10,8 @@
 // ----------------------------------------------------------------------
 
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const wss = new WebSocket.Server({ port: PORT });
@@ -22,6 +24,50 @@ const players = new Map();
 // Map<partyID, { hostID, members: Set<playerID>, started: boolean, startedAt }>
 const parties = new Map();
 let nextPartyID = 1;
+
+// --- Global leaderboard ---
+// Map<playerID, { name, wins, score, kills, updatedAt }>
+// Persisted to disk every 60s. Survives reboots.
+const LEADERBOARD_FILE = path.join(__dirname, 'leaderboard.json');
+const leaderboard = new Map();
+function loadLeaderboard() {
+  try {
+    if (!fs.existsSync(LEADERBOARD_FILE)) return;
+    const raw = fs.readFileSync(LEADERBOARD_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (data && typeof data === 'object') {
+      for (const id in data) leaderboard.set(id, data[id]);
+      console.log(`[arena] loaded ${leaderboard.size} leaderboard entries`);
+    }
+  } catch (e) { console.warn('[arena] leaderboard load failed:', e.message); }
+}
+function saveLeaderboard() {
+  try {
+    const obj = {};
+    for (const [id, v] of leaderboard) obj[id] = v;
+    fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(obj), 'utf8');
+  } catch (e) { console.warn('[arena] leaderboard save failed:', e.message); }
+}
+loadLeaderboard();
+setInterval(saveLeaderboard, 60_000);
+process.on('SIGTERM', saveLeaderboard);
+process.on('SIGINT', () => { saveLeaderboard(); process.exit(0); });
+
+function getTopLeaderboard(limit = 50) {
+  const arr = [];
+  for (const [id, v] of leaderboard) {
+    arr.push({
+      id,
+      name: v.name || '—',
+      wins: v.wins || 0,
+      score: v.score || 0,
+      kills: v.kills || 0,
+      updatedAt: v.updatedAt || 0,
+    });
+  }
+  arr.sort((a, b) => (b.wins - a.wins) || (b.score - a.score) || (b.kills - a.kills));
+  return arr.slice(0, limit);
+}
 
 function makePartyID() { return 'p' + (nextPartyID++); }
 
@@ -271,6 +317,49 @@ wss.on('connection', (ws) => {
       // -------- Heartbeat --------
       case 'ping': {
         send(ws, 'pong', { t: msg.t });
+        return;
+      }
+
+      // -------- Submit a leaderboard score --------
+      // Expects { wins, score, kills, name }. Stores the highest values seen
+      // for this player so a single bad match can't tank their rank.
+      case 'submitScore': {
+        if (!myID) return;
+        const wins  = Math.max(0, Math.min(1e6, Number(msg.wins)  || 0));
+        const score = Math.max(0, Math.min(1e9, Number(msg.score) || 0));
+        const kills = Math.max(0, Math.min(1e6, Number(msg.kills) || 0));
+        const name  = String(msg.name || '').slice(0, 32) || 'Anonymous';
+        const prev = leaderboard.get(myID) || { wins: 0, score: 0, kills: 0 };
+        leaderboard.set(myID, {
+          name,
+          wins:  Math.max(prev.wins,  wins),
+          score: Math.max(prev.score, score),
+          kills: Math.max(prev.kills, kills),
+          updatedAt: Date.now(),
+        });
+        send(ws, 'scoreSubmitted', { ok: true });
+        return;
+      }
+
+      // -------- Fetch the top of the leaderboard --------
+      case 'getLeaderboard': {
+        const limit = Math.max(1, Math.min(200, Number(msg.limit) || 50));
+        const top = getTopLeaderboard(limit);
+        // Also include the requester's rank/entry if they're not in the top
+        let myEntry = null, myRank = null;
+        if (myID) {
+          const idxInTop = top.findIndex(e => e.id === myID);
+          if (idxInTop >= 0) {
+            myRank = idxInTop + 1;
+            myEntry = top[idxInTop];
+          } else if (leaderboard.has(myID)) {
+            // Compute the player's rank in the full sorted list
+            const all = getTopLeaderboard(100000);
+            const i = all.findIndex(e => e.id === myID);
+            if (i >= 0) { myRank = i + 1; myEntry = all[i]; }
+          }
+        }
+        send(ws, 'leaderboard', { top, myEntry, myRank });
         return;
       }
     }
