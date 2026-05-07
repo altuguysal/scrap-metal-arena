@@ -28,10 +28,40 @@ let nextPartyID = 1;
 // --- Global leaderboard ---
 // Map<playerID, { name, wins, score, kills, updatedAt }>
 // Persisted to disk every 60s. Survives reboots.
-const LEADERBOARD_FILE = path.join(__dirname, 'leaderboard.json');
+//
+// Bumping the LEADERBOARD_VERSION wipes every existing entry on first boot
+// after deploy — useful for "reset the leaderboard". The file gets rewritten
+// fresh and the old version is renamed to leaderboard.<oldver>.bak just in case.
+const LEADERBOARD_VERSION = 2;
+const LEADERBOARD_FILE   = path.join(__dirname, 'leaderboard.json');
+// Per-player progress JSON saves (cross-device cloud sync)
+const CLOUD_DIR          = path.join(__dirname, 'cloud-saves');
+try { fs.mkdirSync(CLOUD_DIR, { recursive: true }); } catch (e) {}
+const VERSION_FILE       = path.join(__dirname, 'leaderboard.version');
 const leaderboard = new Map();
 function loadLeaderboard() {
   try {
+    // Check the on-disk version. If it's older than LEADERBOARD_VERSION, wipe.
+    let onDiskVersion = 1;
+    try {
+      if (fs.existsSync(VERSION_FILE)) {
+        onDiskVersion = parseInt(fs.readFileSync(VERSION_FILE, 'utf8'), 10) || 1;
+      }
+    } catch (e) {}
+    if (onDiskVersion < LEADERBOARD_VERSION) {
+      // Back up the old file (just in case), then wipe.
+      try {
+        if (fs.existsSync(LEADERBOARD_FILE)) {
+          const bak = LEADERBOARD_FILE.replace('.json', `.${onDiskVersion}.bak`);
+          fs.renameSync(LEADERBOARD_FILE, bak);
+          console.log(`[arena] leaderboard reset — old file backed up to ${bak}`);
+        }
+      } catch (e) { /* ignore — proceed with wipe */ }
+      try { fs.writeFileSync(VERSION_FILE, String(LEADERBOARD_VERSION), 'utf8'); } catch (e) {}
+      // Leave the in-memory Map empty.
+      console.log(`[arena] leaderboard wiped (version ${onDiskVersion} → ${LEADERBOARD_VERSION})`);
+      return;
+    }
     if (!fs.existsSync(LEADERBOARD_FILE)) return;
     const raw = fs.readFileSync(LEADERBOARD_FILE, 'utf8');
     const data = JSON.parse(raw);
@@ -311,6 +341,73 @@ wss.on('connection', (ws) => {
         const me = players.get(myID);
         if (!me || !me.partyID) return;
         broadcastToParty(me.partyID, 'peerDied', { fromID: myID, killerID: msg.killerID || null });
+        return;
+      }
+
+      // -------- Peer fired a weapon (visual only — damage is via 'hit') --------
+      case 'peerFire': {
+        if (!myID) return;
+        const me = players.get(myID);
+        if (!me || !me.partyID) return;
+        const party = parties.get(me.partyID);
+        if (!party || !party.started) return;
+        broadcastToParty(me.partyID, 'peerFire', {
+          fromID: myID,
+          weapon: msg.weapon || 'mg',
+          x: Number(msg.x) || 0, y: Number(msg.y) || 0, z: Number(msg.z) || 0,
+          dx: Number(msg.dx) || 0, dz: Number(msg.dz) || 0,
+        }, myID);
+        return;
+      }
+
+      // -------- Peer triggered a special ability (visual broadcast) --------
+      case 'peerSpecial': {
+        if (!myID) return;
+        const me = players.get(myID);
+        if (!me || !me.partyID) return;
+        const party = parties.get(me.partyID);
+        if (!party || !party.started) return;
+        broadcastToParty(me.partyID, 'peerSpecial', {
+          fromID: myID,
+          type: String(msg.type || ''),
+          x: Number(msg.x) || 0, y: Number(msg.y) || 0, z: Number(msg.z) || 0,
+          radius: Number(msg.radius) || 0,
+        }, myID);
+        return;
+      }
+
+      // -------- Cloud save: persist a player's progress JSON to disk --------
+      // Stored as cloud-saves/<playerID>.json. Same player ID on a different
+      // device/domain means the same cloud save — that's the cross-domain
+      // bridge. Capped at 100KB to prevent abuse.
+      case 'cloudSave': {
+        const id = String(msg.playerID || myID || '').trim();
+        if (!/^\d{6}$/.test(id)) return;
+        const save = typeof msg.save === 'string' ? msg.save : JSON.stringify(msg.save || {});
+        if (save.length > 100000) return;
+        try {
+          if (!fs.existsSync(CLOUD_DIR)) fs.mkdirSync(CLOUD_DIR, { recursive: true });
+          fs.writeFileSync(path.join(CLOUD_DIR, id + '.json'), save, 'utf8');
+          send(ws, 'cloudSaveAck', { ok: true });
+        } catch (e) {
+          send(ws, 'cloudSaveAck', { ok: false, error: e.message });
+        }
+        return;
+      }
+
+      // -------- Cloud load: read back a player's progress JSON --------
+      case 'cloudLoad': {
+        const id = String(msg.playerID || myID || '').trim();
+        if (!/^\d{6}$/.test(id)) {
+          send(ws, 'cloudLoadResult', { ok: false, save: null, playerID: id });
+          return;
+        }
+        let save = null;
+        try {
+          const p = path.join(CLOUD_DIR, id + '.json');
+          if (fs.existsSync(p)) save = fs.readFileSync(p, 'utf8');
+        } catch (e) {}
+        send(ws, 'cloudLoadResult', { ok: true, save, playerID: id });
         return;
       }
 
