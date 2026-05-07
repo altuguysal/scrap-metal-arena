@@ -12,6 +12,7 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const wss = new WebSocket.Server({ port: PORT });
@@ -37,6 +38,29 @@ const LEADERBOARD_FILE   = path.join(__dirname, 'leaderboard.json');
 // Per-player progress JSON saves (cross-device cloud sync)
 const CLOUD_DIR          = path.join(__dirname, 'cloud-saves');
 try { fs.mkdirSync(CLOUD_DIR, { recursive: true }); } catch (e) {}
+
+// --- Accounts (username + password, save attached) ---
+const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
+const accounts = {};
+function loadAccounts() {
+  try {
+    if (fs.existsSync(ACCOUNTS_FILE)) {
+      Object.assign(accounts, JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')));
+      console.log(`[arena] loaded ${Object.keys(accounts).length} accounts`);
+    }
+  } catch (e) { console.warn('[arena] account load failed:', e.message); }
+}
+function saveAccounts() {
+  try { fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts), 'utf8'); }
+  catch (e) { console.warn('[arena] account save failed:', e.message); }
+}
+loadAccounts();
+setInterval(saveAccounts, 30_000);
+function hashPassword(pwd, salt) {
+  return crypto.createHash('sha256').update(salt + ':' + pwd).digest('hex');
+}
+function makeToken() { return crypto.randomBytes(16).toString('hex'); }
+const sessions = {}; // token -> username (in-memory; restart means re-login)
 const VERSION_FILE       = path.join(__dirname, 'leaderboard.version');
 const leaderboard = new Map();
 function loadLeaderboard() {
@@ -80,8 +104,8 @@ function saveLeaderboard() {
 }
 loadLeaderboard();
 setInterval(saveLeaderboard, 60_000);
-process.on('SIGTERM', saveLeaderboard);
-process.on('SIGINT', () => { saveLeaderboard(); process.exit(0); });
+process.on('SIGTERM', () => { saveLeaderboard(); saveAccounts(); });
+process.on('SIGINT', () => { saveLeaderboard(); saveAccounts(); process.exit(0); });
 
 function getTopLeaderboard(limit = 50) {
   const arr = [];
@@ -408,6 +432,81 @@ wss.on('connection', (ws) => {
           if (fs.existsSync(p)) save = fs.readFileSync(p, 'utf8');
         } catch (e) {}
         send(ws, 'cloudLoadResult', { ok: true, save, playerID: id });
+        return;
+      }
+
+      // -------- Account: register --------
+      case 'accountRegister': {
+        const username = String(msg.username || '').trim().toLowerCase();
+        const password = String(msg.password || '');
+        if (!/^[a-z0-9_-]{3,16}$/.test(username)) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Username must be 3–16 chars (a-z, 0-9, _, -)' });
+          return;
+        }
+        if (password.length < 4) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Password too short (4+ chars)' });
+          return;
+        }
+        if (accounts[username]) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Username already taken' });
+          return;
+        }
+        const salt = crypto.randomBytes(8).toString('hex');
+        accounts[username] = {
+          salt,
+          passwordHash: hashPassword(password, salt),
+          save: '',
+          createdAt: Date.now(),
+          lastLogin: Date.now(),
+        };
+        saveAccounts();
+        const token = makeToken();
+        sessions[token] = username;
+        send(ws, 'accountAuthResult', { ok: true, username, token, save: '' });
+        return;
+      }
+
+      // -------- Account: login --------
+      case 'accountLogin': {
+        const username = String(msg.username || '').trim().toLowerCase();
+        const password = String(msg.password || '');
+        const acc = accounts[username];
+        if (!acc) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Account not found' });
+          return;
+        }
+        if (acc.passwordHash !== hashPassword(password, acc.salt)) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Wrong password' });
+          return;
+        }
+        const token = makeToken();
+        sessions[token] = username;
+        acc.lastLogin = Date.now();
+        send(ws, 'accountAuthResult', { ok: true, username, token, save: acc.save || '' });
+        return;
+      }
+
+      // -------- Account: resume an existing session via token --------
+      case 'accountResume': {
+        const token = String(msg.token || '');
+        const username = sessions[token];
+        if (!username || !accounts[username]) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Session expired', expired: true });
+          return;
+        }
+        send(ws, 'accountAuthResult', { ok: true, username, token, save: accounts[username].save || '' });
+        return;
+      }
+
+      // -------- Account: push the player's progress JSON --------
+      case 'accountSave': {
+        const token = String(msg.token || '');
+        const username = sessions[token];
+        if (!username || !accounts[username]) return;
+        const save = typeof msg.save === 'string' ? msg.save : JSON.stringify(msg.save || {});
+        if (save.length > 100000) return;
+        accounts[username].save = save;
+        send(ws, 'accountSaveAck', { ok: true });
         return;
       }
 
