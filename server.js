@@ -61,6 +61,33 @@ function hashPassword(pwd, salt) {
 }
 function makeToken() { return crypto.randomBytes(16).toString('hex'); }
 const sessions = {}; // token -> username (in-memory; restart means re-login)
+
+// Rough "how much progress is in this save" score so we can refuse to
+// overwrite a richer save with a poorer one. The dimensions chosen here
+// (money, level, xp, garage size, upgrade count) are monotonic in normal
+// gameplay — they only ever go up, they never go down — so a regression
+// almost certainly means the client pushed a fresh-default save by mistake.
+function _saveProgressScore(saveStr) {
+  if (!saveStr || typeof saveStr !== 'string') return 0;
+  let s;
+  try { s = JSON.parse(saveStr); } catch (e) { return 0; }
+  if (!s || typeof s !== 'object') return 0;
+  let score = 0;
+  if (typeof s.money === 'number')  score += Math.max(0, s.money);
+  if (typeof s.level === 'number')  score += Math.max(0, s.level) * 5000;
+  if (typeof s.xp === 'number')     score += Math.max(0, s.xp) * 10;
+  if (Array.isArray(s.cars))        score += s.cars.length * 2000;
+  if (s.ownedCars && typeof s.ownedCars === 'object') {
+    score += Object.keys(s.ownedCars).length * 2000;
+  }
+  if (s.upgrades && typeof s.upgrades === 'object') {
+    for (const k in s.upgrades) {
+      const v = s.upgrades[k];
+      if (typeof v === 'number') score += Math.max(0, v) * 200;
+    }
+  }
+  return score;
+}
 const VERSION_FILE       = path.join(__dirname, 'leaderboard.version');
 const leaderboard = new Map();
 function loadLeaderboard() {
@@ -512,8 +539,53 @@ wss.on('connection', (ws) => {
         if (!username || !accounts[username]) return;
         const save = typeof msg.save === 'string' ? msg.save : JSON.stringify(msg.save || {});
         if (save.length > 100000) return;
+        // REGRESSION GUARD: refuse a save that's significantly poorer than
+        // what we already have. This is what destroyed real progress when
+        // a fresh-default-empty local save got pushed up before we restored
+        // from cloud. The threshold (5000) ignores noise at low levels
+        // while still blocking obvious wipes.
+        const oldScore = _saveProgressScore(accounts[username].save);
+        const newScore = _saveProgressScore(save);
+        if (oldScore > 0 && newScore + 5000 < oldScore) {
+          send(ws, 'accountSaveAck', { ok: false, error: 'rejected: would lose progress', oldScore, newScore });
+          return;
+        }
         accounts[username].save = save;
-        send(ws, 'accountSaveAck', { ok: true });
+        // Persist to disk IMMEDIATELY rather than waiting for the 30s
+        // interval. Render free-tier instances can be killed without a
+        // graceful SIGTERM, and an unwritten save is a lost save.
+        saveAccounts();
+        send(ws, 'accountSaveAck', { ok: true, score: newScore });
+        return;
+      }
+
+      // -------- Account: read your own cloud save (diagnostic) --------
+      // Lets the client show the user exactly what's stored on the server,
+      // and offer a manual "restore from cloud" button.
+      case 'accountInspect': {
+        const token = String(msg.token || '');
+        const username = sessions[token];
+        if (!username || !accounts[username]) {
+          send(ws, 'accountInspectResult', { ok: false, error: 'not signed in' });
+          return;
+        }
+        const raw = accounts[username].save || '';
+        let parsed = null;
+        try { parsed = raw ? JSON.parse(raw) : null; } catch (e) {}
+        send(ws, 'accountInspectResult', {
+          ok: true,
+          username,
+          hasSave: !!raw,
+          score: _saveProgressScore(raw),
+          summary: parsed ? {
+            money: parsed.money,
+            level: parsed.level,
+            xp: parsed.xp,
+            cars: Array.isArray(parsed.cars) ? parsed.cars.length : (parsed.ownedCars ? Object.keys(parsed.ownedCars).length : 0),
+            savedAt: parsed.savedAt,
+          } : null,
+          rawSize: raw.length,
+        });
         return;
       }
 
