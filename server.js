@@ -559,14 +559,32 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // -------- Account: read your own cloud save (diagnostic) --------
-      // Lets the client show the user exactly what's stored on the server,
-      // and offer a manual "restore from cloud" button.
+      // -------- Account: read your own cloud save (diagnostic + recovery) --------
+      // Authenticate via token if we have a live session, otherwise fall back
+      // to username + password. (Sessions are in-memory and disappear when
+      // the Render free-tier instance sleeps; we don't want a dead session
+      // to lock the user out of their own backup.)
+      // Returns the FULL raw save string so the client can offer "restore".
       case 'accountInspect': {
+        let username = null;
         const token = String(msg.token || '');
-        const username = sessions[token];
-        if (!username || !accounts[username]) {
-          send(ws, 'accountInspectResult', { ok: false, error: 'not signed in' });
+        if (token && sessions[token] && accounts[sessions[token]]) {
+          username = sessions[token];
+        } else if (msg.username && msg.password) {
+          const u = String(msg.username || '').trim().toLowerCase();
+          const p = String(msg.password || '');
+          const acc = accounts[u];
+          if (acc && acc.passwordHash === hashPassword(p, acc.salt)) {
+            username = u;
+            // Refresh the session so subsequent calls work without password
+            const newToken = makeToken();
+            sessions[newToken] = username;
+            // Surface the new token so the client can swap it in
+            var _refreshedToken = newToken;
+          }
+        }
+        if (!username) {
+          send(ws, 'accountInspectResult', { ok: false, error: 'auth failed (token expired and no/wrong password)' });
           return;
         }
         const raw = accounts[username].save || '';
@@ -576,6 +594,8 @@ wss.on('connection', (ws) => {
           ok: true,
           username,
           hasSave: !!raw,
+          save: raw, // full raw save string so client can restore directly
+          token: typeof _refreshedToken !== 'undefined' ? _refreshedToken : undefined,
           score: _saveProgressScore(raw),
           summary: parsed ? {
             money: parsed.money,
