@@ -439,8 +439,15 @@ wss.on('connection', (ws) => {
       case 'accountRegister': {
         const username = String(msg.username || '').trim().toLowerCase();
         const password = String(msg.password || '');
-        if (!/^[a-z0-9_-]{3,16}$/.test(username)) {
-          send(ws, 'accountAuthResult', { ok: false, error: 'Username must be 3–16 chars (a-z, 0-9, _, -)' });
+        // Permissive validation — any non-whitespace characters allowed
+        // (Turkish letters, accented chars, etc.). Just enforce length + no
+        // whitespace inside the name.
+        if (username.length < 3 || username.length > 16) {
+          send(ws, 'accountAuthResult', { ok: false, error: `Username must be 3–16 characters (got ${username.length})` });
+          return;
+        }
+        if (/\s/.test(username)) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Username can\'t contain spaces' });
           return;
         }
         if (password.length < 4) {
