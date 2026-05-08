@@ -14,10 +14,67 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Optional dependencies — only loaded if installed and configured.
+// (`pg` for Postgres, `google-auth-library` for Google sign-in.)
+let pg = null;
+let GoogleOAuth2Client = null;
+try { pg = require('pg'); } catch (e) { /* optional */ }
+try { GoogleOAuth2Client = require('google-auth-library').OAuth2Client; } catch (e) { /* optional */ }
+
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const wss = new WebSocket.Server({ port: PORT });
 
 console.log(`[arena] WebSocket server listening on :${PORT}`);
+
+// --- Postgres connection (Neon / any Postgres) ---
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const HAS_DB = !!DATABASE_URL && !!pg;
+const pgPool = HAS_DB
+  ? new pg.Pool({
+      connectionString: DATABASE_URL,
+      // Neon (and most managed Postgres) require SSL. Allow self-signed certs.
+      ssl: { rejectUnauthorized: false },
+      max: 5,
+    })
+  : null;
+
+if (HAS_DB) {
+  console.log('[arena] using Postgres for accounts');
+  pgPool.query(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      username      TEXT PRIMARY KEY,
+      salt          TEXT,
+      password_hash TEXT,
+      google_sub    TEXT UNIQUE,
+      email         TEXT,
+      display_name  TEXT,
+      save          TEXT NOT NULL DEFAULT '',
+      created_at    BIGINT NOT NULL,
+      last_login    BIGINT NOT NULL
+    );
+  `).then(() => pgPool.query(
+    `CREATE INDEX IF NOT EXISTS accounts_google_sub_idx ON accounts(google_sub);`
+  )).then(() => {
+    console.log('[arena] Postgres schema ready');
+  }).catch((e) => {
+    console.warn('[arena] schema init failed:', e.message);
+  });
+} else if (DATABASE_URL && !pg) {
+  console.warn('[arena] DATABASE_URL is set but `pg` package is not installed — falling back to file storage');
+} else {
+  console.log('[arena] DATABASE_URL not set — using file storage (set it to enable Postgres)');
+}
+
+// --- Google OAuth verification ---
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const googleClient = (GoogleOAuth2Client && GOOGLE_CLIENT_ID)
+  ? new GoogleOAuth2Client(GOOGLE_CLIENT_ID)
+  : null;
+if (googleClient) {
+  console.log('[arena] Google sign-in enabled');
+} else if (GOOGLE_CLIENT_ID) {
+  console.warn('[arena] GOOGLE_CLIENT_ID is set but `google-auth-library` is not installed');
+}
 
 // --- Registry ---
 // Map<playerID, { ws, name, partyID, lastSeen, state }>
@@ -39,28 +96,163 @@ const LEADERBOARD_FILE   = path.join(__dirname, 'leaderboard.json');
 const CLOUD_DIR          = path.join(__dirname, 'cloud-saves');
 try { fs.mkdirSync(CLOUD_DIR, { recursive: true }); } catch (e) {}
 
-// --- Accounts (username + password, save attached) ---
+// --- Accounts: Postgres (preferred) with file fallback ---
+// Keep an in-memory file-mode store for local dev / fallback, and a one-time
+// migration from accounts.json into Postgres on first DB connection so
+// existing users don't lose their accounts.
 const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
-const accounts = {};
-function loadAccounts() {
+const fileAccounts = {};
+function loadFileAccounts() {
   try {
     if (fs.existsSync(ACCOUNTS_FILE)) {
-      Object.assign(accounts, JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')));
-      console.log(`[arena] loaded ${Object.keys(accounts).length} accounts`);
+      Object.assign(fileAccounts, JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')));
+      console.log(`[arena] loaded ${Object.keys(fileAccounts).length} file-mode accounts`);
     }
-  } catch (e) { console.warn('[arena] account load failed:', e.message); }
+  } catch (e) { console.warn('[arena] file account load failed:', e.message); }
 }
-function saveAccounts() {
-  try { fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts), 'utf8'); }
-  catch (e) { console.warn('[arena] account save failed:', e.message); }
+function saveFileAccounts() {
+  try { fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(fileAccounts), 'utf8'); }
+  catch (e) { console.warn('[arena] file account save failed:', e.message); }
 }
-loadAccounts();
-setInterval(saveAccounts, 30_000);
+loadFileAccounts();
+// Only persist file accounts when DB is NOT in use; otherwise the file is read-only legacy.
+if (!HAS_DB) setInterval(saveFileAccounts, 30_000);
+
 function hashPassword(pwd, salt) {
   return crypto.createHash('sha256').update(salt + ':' + pwd).digest('hex');
 }
 function makeToken() { return crypto.randomBytes(16).toString('hex'); }
 const sessions = {}; // token -> username (in-memory; restart means re-login)
+
+// One-time migration: pull the legacy accounts.json contents into Postgres.
+// Idempotent — ON CONFLICT DO NOTHING means existing rows are untouched.
+async function migrateFileAccountsToDB() {
+  if (!HAS_DB) return;
+  const usernames = Object.keys(fileAccounts);
+  if (!usernames.length) return;
+  let migrated = 0;
+  for (const u of usernames) {
+    const a = fileAccounts[u] || {};
+    try {
+      const r = await pgPool.query(
+        `INSERT INTO accounts (username, salt, password_hash, save, created_at, last_login)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (username) DO NOTHING`,
+        [u, a.salt || '', a.passwordHash || '', a.save || '',
+         Number(a.createdAt) || Date.now(),
+         Number(a.lastLogin) || Date.now()]
+      );
+      if (r.rowCount) migrated++;
+    } catch (e) {
+      console.warn(`[arena] migrate ${u} failed:`, e.message);
+    }
+  }
+  if (migrated) console.log(`[arena] migrated ${migrated} file accounts → Postgres`);
+}
+// Run migration after the schema-init promise has settled
+setTimeout(() => { migrateFileAccountsToDB().catch(() => {}); }, 1500);
+
+// Storage abstraction. All methods async and return plain JS objects shaped
+// like the legacy file-account record { salt, passwordHash, save, createdAt,
+// lastLogin, googleSub?, email?, displayName? }.
+const accountStore = {
+  async get(username) {
+    if (HAS_DB) {
+      try {
+        const r = await pgPool.query(
+          `SELECT username, salt, password_hash, google_sub, email, display_name,
+                  save, created_at, last_login
+             FROM accounts WHERE username = $1`,
+          [username]
+        );
+        if (!r.rows.length) return null;
+        const row = r.rows[0];
+        return {
+          username: row.username,
+          salt: row.salt || '',
+          passwordHash: row.password_hash || '',
+          googleSub: row.google_sub || null,
+          email: row.email || null,
+          displayName: row.display_name || null,
+          save: row.save || '',
+          createdAt: Number(row.created_at),
+          lastLogin: Number(row.last_login),
+        };
+      } catch (e) { console.warn('[arena] db get failed:', e.message); return null; }
+    }
+    return fileAccounts[username] ? { username, ...fileAccounts[username] } : null;
+  },
+  async getByGoogleSub(sub) {
+    if (HAS_DB) {
+      try {
+        const r = await pgPool.query(
+          `SELECT username FROM accounts WHERE google_sub = $1`, [sub]
+        );
+        if (!r.rows.length) return null;
+        return await this.get(r.rows[0].username);
+      } catch (e) { console.warn('[arena] db getByGoogleSub failed:', e.message); return null; }
+    }
+    for (const u in fileAccounts) {
+      if (fileAccounts[u].googleSub === sub) return { username: u, ...fileAccounts[u] };
+    }
+    return null;
+  },
+  async create(username, data) {
+    const now = Date.now();
+    if (HAS_DB) {
+      await pgPool.query(
+        `INSERT INTO accounts (username, salt, password_hash, google_sub, email, display_name,
+                               save, created_at, last_login)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [username, data.salt || null, data.passwordHash || null,
+         data.googleSub || null, data.email || null, data.displayName || null,
+         data.save || '', now, now]
+      );
+    } else {
+      fileAccounts[username] = {
+        salt: data.salt || '', passwordHash: data.passwordHash || '',
+        googleSub: data.googleSub || null, email: data.email || null,
+        displayName: data.displayName || null,
+        save: data.save || '', createdAt: now, lastLogin: now,
+      };
+      saveFileAccounts();
+    }
+  },
+  async updateLogin(username) {
+    const now = Date.now();
+    if (HAS_DB) {
+      try { await pgPool.query('UPDATE accounts SET last_login = $1 WHERE username = $2', [now, username]); }
+      catch (e) {}
+    } else if (fileAccounts[username]) {
+      fileAccounts[username].lastLogin = now;
+      saveFileAccounts();
+    }
+  },
+  async updateSave(username, save) {
+    if (HAS_DB) {
+      try { await pgPool.query('UPDATE accounts SET save = $1 WHERE username = $2', [save, username]); }
+      catch (e) { console.warn('[arena] db updateSave failed:', e.message); }
+    } else if (fileAccounts[username]) {
+      fileAccounts[username].save = save;
+      saveFileAccounts();
+    }
+  },
+  async linkGoogle(username, googleSub, email, displayName) {
+    if (HAS_DB) {
+      try {
+        await pgPool.query(
+          'UPDATE accounts SET google_sub = $1, email = $2, display_name = $3 WHERE username = $4',
+          [googleSub, email || null, displayName || null, username]
+        );
+      } catch (e) { console.warn('[arena] db linkGoogle failed:', e.message); }
+    } else if (fileAccounts[username]) {
+      fileAccounts[username].googleSub = googleSub;
+      fileAccounts[username].email = email || null;
+      fileAccounts[username].displayName = displayName || null;
+      saveFileAccounts();
+    }
+  },
+};
 
 // Rough "how much progress is in this save" score so we can refuse to
 // overwrite a richer save with a poorer one. The dimensions chosen here
@@ -131,8 +323,8 @@ function saveLeaderboard() {
 }
 loadLeaderboard();
 setInterval(saveLeaderboard, 60_000);
-process.on('SIGTERM', () => { saveLeaderboard(); saveAccounts(); });
-process.on('SIGINT', () => { saveLeaderboard(); saveAccounts(); process.exit(0); });
+process.on('SIGTERM', () => { saveLeaderboard(); if (!HAS_DB) saveFileAccounts(); });
+process.on('SIGINT', () => { saveLeaderboard(); if (!HAS_DB) saveFileAccounts(); process.exit(0); });
 
 function getTopLeaderboard(limit = 50) {
   const arr = [];
@@ -206,7 +398,7 @@ function leaveParty(playerID) {
 wss.on('connection', (ws) => {
   let myID = null;
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
 
@@ -466,9 +658,6 @@ wss.on('connection', (ws) => {
       case 'accountRegister': {
         const username = String(msg.username || '').trim().toLowerCase();
         const password = String(msg.password || '');
-        // Permissive validation — any non-whitespace characters allowed
-        // (Turkish letters, accented chars, etc.). Just enforce length + no
-        // whitespace inside the name.
         if (username.length < 3 || username.length > 16) {
           send(ws, 'accountAuthResult', { ok: false, error: `Username must be 3–16 characters (got ${username.length})` });
           return;
@@ -481,22 +670,23 @@ wss.on('connection', (ws) => {
           send(ws, 'accountAuthResult', { ok: false, error: 'Password too short (4+ chars)' });
           return;
         }
-        if (accounts[username]) {
-          send(ws, 'accountAuthResult', { ok: false, error: 'Username already taken' });
-          return;
+        try {
+          const existing = await accountStore.get(username);
+          if (existing) {
+            send(ws, 'accountAuthResult', { ok: false, error: 'Username already taken' });
+            return;
+          }
+          const salt = crypto.randomBytes(8).toString('hex');
+          await accountStore.create(username, {
+            salt, passwordHash: hashPassword(password, salt), save: '',
+          });
+          const token = makeToken();
+          sessions[token] = username;
+          send(ws, 'accountAuthResult', { ok: true, username, token, save: '' });
+        } catch (e) {
+          console.warn('[arena] register failed:', e.message);
+          send(ws, 'accountAuthResult', { ok: false, error: 'Server error — try again in a moment' });
         }
-        const salt = crypto.randomBytes(8).toString('hex');
-        accounts[username] = {
-          salt,
-          passwordHash: hashPassword(password, salt),
-          save: '',
-          createdAt: Date.now(),
-          lastLogin: Date.now(),
-        };
-        saveAccounts();
-        const token = makeToken();
-        sessions[token] = username;
-        send(ws, 'accountAuthResult', { ok: true, username, token, save: '' });
         return;
       }
 
@@ -504,19 +694,88 @@ wss.on('connection', (ws) => {
       case 'accountLogin': {
         const username = String(msg.username || '').trim().toLowerCase();
         const password = String(msg.password || '');
-        const acc = accounts[username];
-        if (!acc) {
-          send(ws, 'accountAuthResult', { ok: false, error: 'Account not found' });
+        try {
+          const acc = await accountStore.get(username);
+          if (!acc) {
+            send(ws, 'accountAuthResult', { ok: false, error: 'Account not found' });
+            return;
+          }
+          if (!acc.passwordHash || acc.passwordHash !== hashPassword(password, acc.salt)) {
+            send(ws, 'accountAuthResult', { ok: false, error: 'Wrong password' });
+            return;
+          }
+          const token = makeToken();
+          sessions[token] = username;
+          accountStore.updateLogin(username).catch(() => {});
+          send(ws, 'accountAuthResult', { ok: true, username, token, save: acc.save || '' });
+        } catch (e) {
+          console.warn('[arena] login failed:', e.message);
+          send(ws, 'accountAuthResult', { ok: false, error: 'Server error — try again in a moment' });
+        }
+        return;
+      }
+
+      // -------- Account: Google sign-in --------
+      // Verifies a Google ID token, then either signs into an existing
+      // Google-linked account or creates a new one. The username for new
+      // Google accounts is derived from the email local-part (with a numeric
+      // suffix if the base name is taken). Existing username/password
+      // accounts can OPT to link Google later via 'accountLinkGoogle'.
+      case 'accountGoogleSignIn': {
+        if (!googleClient) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Google sign-in not configured on server' });
           return;
         }
-        if (acc.passwordHash !== hashPassword(password, acc.salt)) {
-          send(ws, 'accountAuthResult', { ok: false, error: 'Wrong password' });
+        const idToken = String(msg.idToken || '');
+        if (!idToken) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Missing ID token' });
           return;
         }
-        const token = makeToken();
-        sessions[token] = username;
-        acc.lastLogin = Date.now();
-        send(ws, 'accountAuthResult', { ok: true, username, token, save: acc.save || '' });
+        try {
+          const ticket = await googleClient.verifyIdToken({
+            idToken, audience: GOOGLE_CLIENT_ID,
+          });
+          const payload = ticket.getPayload();
+          if (!payload || !payload.sub) {
+            send(ws, 'accountAuthResult', { ok: false, error: 'Invalid Google token' });
+            return;
+          }
+          const sub = payload.sub;
+          const email = payload.email || null;
+          const displayName = payload.name || (email ? email.split('@')[0] : 'player');
+          // 1) Find by Google sub
+          let acc = await accountStore.getByGoogleSub(sub);
+          let username;
+          if (acc) {
+            username = acc.username;
+          } else {
+            // 2) New Google account — derive a username from email
+            const base = (email ? email.split('@')[0] : 'player')
+              .toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'player';
+            let candidate = base;
+            let n = 0;
+            while (await accountStore.get(candidate)) {
+              n += 1;
+              candidate = (base + n).slice(0, 16);
+              if (n > 9999) { candidate = 'p' + Date.now().toString(36); break; }
+            }
+            username = candidate;
+            await accountStore.create(username, {
+              googleSub: sub, email, displayName, save: '',
+            });
+            acc = await accountStore.get(username);
+          }
+          const token = makeToken();
+          sessions[token] = username;
+          accountStore.updateLogin(username).catch(() => {});
+          send(ws, 'accountAuthResult', {
+            ok: true, username, token, save: acc.save || '',
+            email, displayName,
+          });
+        } catch (e) {
+          console.warn('[arena] google sign-in failed:', e.message);
+          send(ws, 'accountAuthResult', { ok: false, error: 'Google verification failed' });
+        }
         return;
       }
 
@@ -524,11 +783,20 @@ wss.on('connection', (ws) => {
       case 'accountResume': {
         const token = String(msg.token || '');
         const username = sessions[token];
-        if (!username || !accounts[username]) {
+        if (!username) {
           send(ws, 'accountAuthResult', { ok: false, error: 'Session expired', expired: true });
           return;
         }
-        send(ws, 'accountAuthResult', { ok: true, username, token, save: accounts[username].save || '' });
+        try {
+          const acc = await accountStore.get(username);
+          if (!acc) {
+            send(ws, 'accountAuthResult', { ok: false, error: 'Session expired', expired: true });
+            return;
+          }
+          send(ws, 'accountAuthResult', { ok: true, username, token, save: acc.save || '' });
+        } catch (e) {
+          send(ws, 'accountAuthResult', { ok: false, error: 'Server error', expired: false });
+        }
         return;
       }
 
@@ -536,76 +804,84 @@ wss.on('connection', (ws) => {
       case 'accountSave': {
         const token = String(msg.token || '');
         const username = sessions[token];
-        if (!username || !accounts[username]) return;
+        if (!username) return;
         const save = typeof msg.save === 'string' ? msg.save : JSON.stringify(msg.save || {});
         if (save.length > 100000) return;
-        // REGRESSION GUARD: refuse a save that's significantly poorer than
-        // what we already have. This is what destroyed real progress when
-        // a fresh-default-empty local save got pushed up before we restored
-        // from cloud. The threshold (5000) ignores noise at low levels
-        // while still blocking obvious wipes.
-        const oldScore = _saveProgressScore(accounts[username].save);
-        const newScore = _saveProgressScore(save);
-        if (oldScore > 0 && newScore + 5000 < oldScore) {
-          send(ws, 'accountSaveAck', { ok: false, error: 'rejected: would lose progress', oldScore, newScore });
-          return;
+        try {
+          const acc = await accountStore.get(username);
+          if (!acc) return;
+          // REGRESSION GUARD: refuse a save that's significantly poorer than
+          // what we already have. This is what destroyed real progress when
+          // a fresh-default-empty local save got pushed up before we restored
+          // from cloud. The threshold (5000) ignores noise at low levels
+          // while still blocking obvious wipes.
+          const oldScore = _saveProgressScore(acc.save);
+          const newScore = _saveProgressScore(save);
+          if (oldScore > 0 && newScore + 5000 < oldScore) {
+            send(ws, 'accountSaveAck', { ok: false, error: 'rejected: would lose progress', oldScore, newScore });
+            return;
+          }
+          await accountStore.updateSave(username, save);
+          send(ws, 'accountSaveAck', { ok: true, score: newScore });
+        } catch (e) {
+          console.warn('[arena] save failed:', e.message);
         }
-        accounts[username].save = save;
-        // Persist to disk IMMEDIATELY rather than waiting for the 30s
-        // interval. Render free-tier instances can be killed without a
-        // graceful SIGTERM, and an unwritten save is a lost save.
-        saveAccounts();
-        send(ws, 'accountSaveAck', { ok: true, score: newScore });
         return;
       }
 
       // -------- Account: read your own cloud save (diagnostic + recovery) --------
-      // Authenticate via token if we have a live session, otherwise fall back
-      // to username + password. (Sessions are in-memory and disappear when
-      // the Render free-tier instance sleeps; we don't want a dead session
-      // to lock the user out of their own backup.)
+      // Auth via token if live, else fall back to username + password.
       // Returns the FULL raw save string so the client can offer "restore".
       case 'accountInspect': {
         let username = null;
+        let refreshedToken = null;
         const token = String(msg.token || '');
-        if (token && sessions[token] && accounts[sessions[token]]) {
+        if (token && sessions[token]) {
           username = sessions[token];
         } else if (msg.username && msg.password) {
           const u = String(msg.username || '').trim().toLowerCase();
           const p = String(msg.password || '');
-          const acc = accounts[u];
-          if (acc && acc.passwordHash === hashPassword(p, acc.salt)) {
-            username = u;
-            // Refresh the session so subsequent calls work without password
-            const newToken = makeToken();
-            sessions[newToken] = username;
-            // Surface the new token so the client can swap it in
-            var _refreshedToken = newToken;
-          }
+          try {
+            const acc = await accountStore.get(u);
+            if (acc && acc.passwordHash && acc.passwordHash === hashPassword(p, acc.salt)) {
+              username = u;
+              refreshedToken = makeToken();
+              sessions[refreshedToken] = username;
+            }
+          } catch (e) {}
         }
         if (!username) {
           send(ws, 'accountInspectResult', { ok: false, error: 'auth failed (token expired and no/wrong password)' });
           return;
         }
-        const raw = accounts[username].save || '';
-        let parsed = null;
-        try { parsed = raw ? JSON.parse(raw) : null; } catch (e) {}
-        send(ws, 'accountInspectResult', {
-          ok: true,
-          username,
-          hasSave: !!raw,
-          save: raw, // full raw save string so client can restore directly
-          token: typeof _refreshedToken !== 'undefined' ? _refreshedToken : undefined,
-          score: _saveProgressScore(raw),
-          summary: parsed ? {
-            money: parsed.money,
-            level: parsed.level,
-            xp: parsed.xp,
-            cars: Array.isArray(parsed.cars) ? parsed.cars.length : (parsed.ownedCars ? Object.keys(parsed.ownedCars).length : 0),
-            savedAt: parsed.savedAt,
-          } : null,
-          rawSize: raw.length,
-        });
+        try {
+          const acc = await accountStore.get(username);
+          if (!acc) {
+            send(ws, 'accountInspectResult', { ok: false, error: 'account vanished' });
+            return;
+          }
+          const raw = acc.save || '';
+          let parsed = null;
+          try { parsed = raw ? JSON.parse(raw) : null; } catch (e) {}
+          send(ws, 'accountInspectResult', {
+            ok: true,
+            username,
+            hasSave: !!raw,
+            save: raw,
+            token: refreshedToken || undefined,
+            score: _saveProgressScore(raw),
+            summary: parsed ? {
+              money: parsed.money,
+              level: parsed.level,
+              xp: parsed.xp,
+              cars: Array.isArray(parsed.cars) ? parsed.cars.length : (parsed.ownedCars ? Object.keys(parsed.ownedCars).length : 0),
+              savedAt: parsed.savedAt,
+            } : null,
+            rawSize: raw.length,
+          });
+        } catch (e) {
+          send(ws, 'accountInspectResult', { ok: false, error: 'server error' });
+        }
         return;
       }
 
